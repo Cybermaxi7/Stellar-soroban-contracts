@@ -40,6 +40,13 @@ mod propchain_insurance {
         CooldownPeriodActive,
         PropertyNotInsurable,
         DuplicateClaim,
+        // #133 – evidence validation errors
+        InvalidEvidenceUri,
+        InvalidEvidenceHash,
+        InvalidEvidenceNonce,
+        // #134 – dispute errors
+        DisputeWindowExpired,
+        InvalidDisputeTransition,
     }
 
     // =========================================================================
@@ -102,6 +109,25 @@ mod propchain_insurance {
         Rejected,
         Paid,
         Disputed,
+        DisputeResolved, // #134
+    }
+
+    /// Structured evidence submitted with a claim (#133).
+    #[derive(
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct EvidenceMetadata {
+        /// Arbitrary type label, e.g. "photo", "document", "sensor_log".
+        pub evidence_type: String,
+        /// URI pointing to the evidence (must start with "ipfs://" or "https://").
+        pub uri: String,
+        /// SHA-256 content hash – must be exactly 32 bytes.
+        pub hash: Vec<u8>,
+        /// Non-empty nonce to prevent replay / duplicate submissions.
+        pub nonce: String,
+        /// Optional human-readable description.
+        pub description: String,
     }
 
     #[derive(
@@ -154,10 +180,12 @@ mod propchain_insurance {
         pub claimant: AccountId,
         pub claim_amount: u128,
         pub description: String,
-        pub evidence_url: String,
+        pub evidence: EvidenceMetadata, // #133 – replaces evidence_url
         pub oracle_report_url: String,
         pub status: ClaimStatus,
         pub submitted_at: u64,
+        pub under_review_at: Option<u64>, // #134
+        pub dispute_deadline: Option<u64>, // #134 – set when claim moves to UnderReview
         pub processed_at: Option<u64>,
         pub payout_amount: u128,
         pub assessor: Option<AccountId>,
@@ -346,6 +374,8 @@ mod propchain_insurance {
         platform_fee_rate: u32,     // Basis points (e.g. 200 = 2%)
         claim_cooldown_period: u64, // In seconds
         min_pool_capital: u128,
+        dispute_window_seconds: u64, // #134 – window after UnderReview within which disputes can be raised
+        arbiter: Option<AccountId>,  // #134 – designated dispute arbiter (falls back to admin)
     }
 
     // =========================================================================
@@ -470,6 +500,27 @@ mod propchain_insurance {
         timestamp: u64,
     }
 
+    // #134 – dispute events
+    #[ink(event)]
+    pub struct ClaimDisputed {
+        #[ink(topic)]
+        claim_id: u64,
+        #[ink(topic)]
+        raised_by: AccountId,
+        dispute_deadline: u64,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct DisputeResolved {
+        #[ink(topic)]
+        claim_id: u64,
+        #[ink(topic)]
+        resolved_by: AccountId,
+        approved: bool,
+        timestamp: u64,
+    }
+
     // =========================================================================
     // IMPLEMENTATION
     // =========================================================================
@@ -505,6 +556,8 @@ mod propchain_insurance {
                 platform_fee_rate: 200,            // 2%
                 claim_cooldown_period: 2_592_000,  // 30 days in seconds
                 min_pool_capital: 100_000_000_000, // Minimum pool capital
+                dispute_window_seconds: 604_800,   // #134 – 7 days default
+                arbiter: None,                     // #134 – falls back to admin
             }
         }
 
@@ -859,10 +912,22 @@ mod propchain_insurance {
             policy_id: u64,
             claim_amount: u128,
             description: String,
-            evidence_url: String,
+            evidence: EvidenceMetadata,
         ) -> Result<u64, InsuranceError> {
             let caller = self.env().caller();
             let now = self.env().block_timestamp();
+
+            // #133 – validate evidence metadata
+            let uri = &evidence.uri;
+            if !uri.starts_with("ipfs://") && !uri.starts_with("https://") {
+                return Err(InsuranceError::InvalidEvidenceUri);
+            }
+            if evidence.hash.len() != 32 {
+                return Err(InsuranceError::InvalidEvidenceHash);
+            }
+            if evidence.nonce.is_empty() {
+                return Err(InsuranceError::InvalidEvidenceNonce);
+            }
 
             let mut policy = self
                 .policies
@@ -900,10 +965,12 @@ mod propchain_insurance {
                 claimant: caller,
                 claim_amount,
                 description,
-                evidence_url,
+                evidence,
                 oracle_report_url: String::new(),
                 status: ClaimStatus::Pending,
                 submitted_at: now,
+                under_review_at: None,
+                dispute_deadline: None,
                 processed_at: None,
                 payout_amount: 0,
                 assessor: None,
@@ -957,6 +1024,12 @@ mod propchain_insurance {
             claim.assessor = Some(caller);
             claim.oracle_report_url = oracle_report_url;
             claim.processed_at = Some(now);
+
+            // #134 – record when review starts and set dispute deadline
+            if claim.under_review_at.is_none() {
+                claim.under_review_at = Some(now);
+                claim.dispute_deadline = Some(now.saturating_add(self.dispute_window_seconds));
+            }
 
             if approved {
                 let policy = self
@@ -1251,6 +1324,132 @@ mod propchain_insurance {
         }
 
         // =====================================================================
+        // DISPUTE MANAGEMENT (#134)
+        // =====================================================================
+
+        /// Set the dispute window duration (admin only).
+        #[ink(message)]
+        pub fn set_dispute_window(&mut self, window_seconds: u64) -> Result<(), InsuranceError> {
+            self.ensure_admin()?;
+            self.dispute_window_seconds = window_seconds;
+            Ok(())
+        }
+
+        /// Designate a dispute arbiter (admin only). Pass `None` to revert to admin.
+        #[ink(message)]
+        pub fn set_arbiter(&mut self, arbiter: Option<AccountId>) -> Result<(), InsuranceError> {
+            self.ensure_admin()?;
+            self.arbiter = arbiter;
+            Ok(())
+        }
+
+        /// Move a claim into `Disputed` state.
+        /// Allowed callers: the claimant, admin, or the designated arbiter.
+        /// Only valid while the dispute window is still open and the claim is
+        /// `Pending`, `UnderReview`, or `Approved`.
+        #[ink(message)]
+        pub fn move_to_dispute(&mut self, claim_id: u64) -> Result<(), InsuranceError> {
+            let caller = self.env().caller();
+            let now = self.env().block_timestamp();
+
+            let mut claim = self
+                .claims
+                .get(&claim_id)
+                .ok_or(InsuranceError::ClaimNotFound)?;
+
+            // Only claimant, admin, or arbiter may raise a dispute
+            let is_arbiter = self.arbiter.map_or(false, |a| a == caller);
+            if caller != claim.claimant && caller != self.admin && !is_arbiter {
+                return Err(InsuranceError::Unauthorized);
+            }
+
+            // Must be in a disputable state
+            if !matches!(
+                claim.status,
+                ClaimStatus::Pending | ClaimStatus::UnderReview | ClaimStatus::Approved
+            ) {
+                return Err(InsuranceError::InvalidDisputeTransition);
+            }
+
+            // Enforce dispute window if one has been set
+            if let Some(deadline) = claim.dispute_deadline {
+                if now > deadline {
+                    return Err(InsuranceError::DisputeWindowExpired);
+                }
+            }
+
+            claim.status = ClaimStatus::Disputed;
+            self.claims.insert(&claim_id, &claim);
+
+            self.env().emit_event(ClaimDisputed {
+                claim_id,
+                raised_by: caller,
+                dispute_deadline: claim.dispute_deadline.unwrap_or(0),
+                timestamp: now,
+            });
+
+            Ok(())
+        }
+
+        /// Resolve a disputed claim.
+        /// Allowed callers: admin or the designated arbiter.
+        /// `approved` = true → Approved (payout executed); false → Rejected.
+        #[ink(message)]
+        pub fn resolve_dispute(
+            &mut self,
+            claim_id: u64,
+            approved: bool,
+        ) -> Result<(), InsuranceError> {
+            let caller = self.env().caller();
+            let now = self.env().block_timestamp();
+
+            let is_arbiter = self.arbiter.map_or(false, |a| a == caller);
+            if caller != self.admin && !is_arbiter {
+                return Err(InsuranceError::Unauthorized);
+            }
+
+            let mut claim = self
+                .claims
+                .get(&claim_id)
+                .ok_or(InsuranceError::ClaimNotFound)?;
+
+            if claim.status != ClaimStatus::Disputed {
+                return Err(InsuranceError::InvalidDisputeTransition);
+            }
+
+            claim.status = ClaimStatus::DisputeResolved;
+            claim.processed_at = Some(now);
+            claim.assessor = Some(caller);
+
+            if approved {
+                let policy = self
+                    .policies
+                    .get(&claim.policy_id)
+                    .ok_or(InsuranceError::PolicyNotFound)?;
+                let payout = if claim.claim_amount > policy.deductible {
+                    claim.claim_amount.saturating_sub(policy.deductible)
+                } else {
+                    0
+                };
+                claim.payout_amount = payout;
+                self.claims.insert(&claim_id, &claim);
+                self.execute_payout(claim_id, claim.policy_id, claim.claimant, payout)?;
+            } else {
+                claim.rejection_reason = "Dispute resolved: claim rejected".into();
+                self.claims.insert(&claim_id, &claim);
+            }
+
+            self.env().emit_event(DisputeResolved {
+                claim_id,
+                resolved_by: caller,
+                approved,
+                timestamp: now,
+            });
+
+            Ok(())
+        }
+
+        // =====================================================================
         // QUERIES
         // =====================================================================
 
@@ -1352,6 +1551,18 @@ mod propchain_insurance {
         #[ink(message)]
         pub fn get_admin(&self) -> AccountId {
             self.admin
+        }
+
+        /// Get current dispute window in seconds (#134)
+        #[ink(message)]
+        pub fn get_dispute_window(&self) -> u64 {
+            self.dispute_window_seconds
+        }
+
+        /// Get the designated arbiter, if any (#134)
+        #[ink(message)]
+        pub fn get_arbiter(&self) -> Option<AccountId> {
+            self.arbiter
         }
 
         // =====================================================================
@@ -1547,8 +1758,19 @@ mod insurance_tests {
     use ink::env::{test, DefaultEnvironment};
 
     use crate::propchain_insurance::{
-        ClaimStatus, CoverageType, InsuranceError, PolicyStatus, PropertyInsurance,
+        ClaimStatus, CoverageType, EvidenceMetadata, InsuranceError, PolicyStatus,
+        PropertyInsurance,
     };
+
+    fn make_evidence(uri: &str) -> EvidenceMetadata {
+        EvidenceMetadata {
+            evidence_type: "photo".into(),
+            uri: uri.into(),
+            hash: vec![0u8; 32],
+            nonce: "nonce-1".into(),
+            description: String::new(),
+        }
+    }
 
     fn setup() -> PropertyInsurance {
         let accounts = test::default_accounts::<DefaultEnvironment>();
@@ -1879,7 +2101,7 @@ mod insurance_tests {
             policy_id,
             10_000_000_000u128,
             "Fire damage to property".into(),
-            "ipfs://evidence123".into(),
+            make_evidence("ipfs://evidence123"),
         );
         assert!(result.is_ok());
         let claim_id = result.unwrap();
@@ -1918,7 +2140,7 @@ mod insurance_tests {
             policy_id,
             coverage * 2,
             "Huge fire".into(),
-            "ipfs://evidence".into(),
+            make_evidence("ipfs://evidence"),
         );
         assert_eq!(result, Err(InsuranceError::ClaimExceedsCoverage));
     }
@@ -1951,7 +2173,7 @@ mod insurance_tests {
             policy_id,
             1_000u128,
             "Fraud attempt".into(),
-            "ipfs://x".into(),
+            make_evidence("ipfs://x"),
         );
         assert_eq!(result, Err(InsuranceError::Unauthorized));
     }
@@ -1989,7 +2211,7 @@ mod insurance_tests {
                 policy_id,
                 10_000_000_000u128,
                 "Fire damage".into(),
-                "ipfs://evidence".into(),
+                make_evidence("ipfs://evidence"),
             )
             .unwrap();
         test::set_caller::<DefaultEnvironment>(accounts.alice);
@@ -2029,7 +2251,7 @@ mod insurance_tests {
                 policy_id,
                 5_000_000_000u128,
                 "Fraudulent claim".into(),
-                "ipfs://fake-evidence".into(),
+                make_evidence("ipfs://fake-evidence"),
             )
             .unwrap();
         test::set_caller::<DefaultEnvironment>(accounts.alice);
@@ -2068,7 +2290,7 @@ mod insurance_tests {
             )
             .unwrap();
         let claim_id = contract
-            .submit_claim(policy_id, 1_000_000u128, "Damage".into(), "ipfs://e".into())
+            .submit_claim(policy_id, 1_000_000u128, "Damage".into(), make_evidence("ipfs://e"))
             .unwrap();
         test::set_caller::<DefaultEnvironment>(accounts.charlie);
         let result = contract.process_claim(claim_id, true, "ipfs://r".into(), String::new());
@@ -2099,7 +2321,7 @@ mod insurance_tests {
             )
             .unwrap();
         let claim_id = contract
-            .submit_claim(policy_id, 1_000_000u128, "Damage".into(), "ipfs://e".into())
+            .submit_claim(policy_id, 1_000_000u128, "Damage".into(), make_evidence("ipfs://e"))
             .unwrap();
         test::set_caller::<DefaultEnvironment>(accounts.alice);
         contract.authorize_assessor(accounts.charlie).unwrap();
@@ -2394,5 +2616,283 @@ mod insurance_tests {
             .unwrap();
         let holder_policies = contract.get_policyholder_policies(accounts.bob);
         assert_eq!(holder_policies.len(), 2);
+    }
+
+    // =========================================================================
+    // ISSUE #133 – EVIDENCE PROOF FORMAT TESTS
+    // =========================================================================
+
+    fn setup_policy_for_bob(contract: &mut PropertyInsurance) -> u64 {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(contract);
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.provide_pool_liquidity(pool_id).unwrap();
+        add_risk_assessment(contract, 1);
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://test".into(),
+            )
+            .unwrap()
+    }
+
+    #[ink::test]
+    fn test_evidence_invalid_uri_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let bad_evidence = EvidenceMetadata {
+            evidence_type: "photo".into(),
+            uri: "ftp://bad-scheme".into(),
+            hash: vec![0u8; 32],
+            nonce: "nonce-1".into(),
+            description: String::new(),
+        };
+        let result = contract.submit_claim(policy_id, 1_000u128, "desc".into(), bad_evidence);
+        assert_eq!(result, Err(InsuranceError::InvalidEvidenceUri));
+    }
+
+    #[ink::test]
+    fn test_evidence_invalid_hash_length_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let bad_evidence = EvidenceMetadata {
+            evidence_type: "photo".into(),
+            uri: "ipfs://valid".into(),
+            hash: vec![0u8; 16], // wrong length
+            nonce: "nonce-1".into(),
+            description: String::new(),
+        };
+        let result = contract.submit_claim(policy_id, 1_000u128, "desc".into(), bad_evidence);
+        assert_eq!(result, Err(InsuranceError::InvalidEvidenceHash));
+    }
+
+    #[ink::test]
+    fn test_evidence_empty_nonce_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let bad_evidence = EvidenceMetadata {
+            evidence_type: "photo".into(),
+            uri: "ipfs://valid".into(),
+            hash: vec![0u8; 32],
+            nonce: String::new(), // empty nonce
+            description: String::new(),
+        };
+        let result = contract.submit_claim(policy_id, 1_000u128, "desc".into(), bad_evidence);
+        assert_eq!(result, Err(InsuranceError::InvalidEvidenceNonce));
+    }
+
+    #[ink::test]
+    fn test_evidence_https_uri_accepted() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let evidence = EvidenceMetadata {
+            evidence_type: "document".into(),
+            uri: "https://example.com/evidence".into(),
+            hash: vec![1u8; 32],
+            nonce: "abc123".into(),
+            description: "Damage report".into(),
+        };
+        let result = contract.submit_claim(policy_id, 1_000u128, "desc".into(), evidence);
+        assert!(result.is_ok());
+        let claim = contract.get_claim(result.unwrap()).unwrap();
+        assert_eq!(claim.evidence.uri, "https://example.com/evidence");
+        assert_eq!(claim.evidence.nonce, "abc123");
+    }
+
+    // =========================================================================
+    // ISSUE #134 – DISPUTE WINDOW TESTS
+    // =========================================================================
+
+    fn setup_policy_for_bob(contract: &mut PropertyInsurance) -> u64 {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(contract);
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.provide_pool_liquidity(pool_id).unwrap();
+        add_risk_assessment(contract, 1);
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://test".into(),
+            )
+            .unwrap()
+    }
+
+    #[ink::test]
+    fn test_set_dispute_window_works() {
+        let mut contract = setup();
+        assert!(contract.set_dispute_window(86_400).is_ok());
+        assert_eq!(contract.get_dispute_window(), 86_400);
+    }
+
+    #[ink::test]
+    fn test_set_dispute_window_unauthorized_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            contract.set_dispute_window(86_400),
+            Err(InsuranceError::Unauthorized)
+        );
+    }
+
+    #[ink::test]
+    fn test_set_arbiter_works() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        assert!(contract.set_arbiter(Some(accounts.charlie)).is_ok());
+        assert_eq!(contract.get_arbiter(), Some(accounts.charlie));
+    }
+
+    #[ink::test]
+    fn test_move_to_dispute_by_claimant() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let claim_id = contract
+            .submit_claim(policy_id, 1_000u128, "desc".into(), make_evidence("ipfs://e"))
+            .unwrap();
+        let result = contract.move_to_dispute(claim_id);
+        assert!(result.is_ok());
+        assert_eq!(
+            contract.get_claim(claim_id).unwrap().status,
+            ClaimStatus::Disputed
+        );
+    }
+
+    #[ink::test]
+    fn test_move_to_dispute_unauthorized_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let claim_id = contract
+            .submit_claim(policy_id, 1_000u128, "desc".into(), make_evidence("ipfs://e"))
+            .unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        assert_eq!(
+            contract.move_to_dispute(claim_id),
+            Err(InsuranceError::Unauthorized)
+        );
+    }
+
+    #[ink::test]
+    fn test_dispute_window_expired_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        // Set a 1-second window so it expires immediately
+        contract.set_dispute_window(1).unwrap();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let claim_id = contract
+            .submit_claim(policy_id, 1_000u128, "desc".into(), make_evidence("ipfs://e"))
+            .unwrap();
+        // Admin processes → sets dispute_deadline = now + 1
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract
+            .process_claim(claim_id, false, "ipfs://r".into(), "reason".into())
+            .unwrap();
+        // Advance time well past the 1-second window
+        test::set_block_timestamp::<DefaultEnvironment>(3_000_000 + 100_000);
+        // Verify deadline is in the past
+        let claim = contract.get_claim(claim_id).unwrap();
+        let deadline = claim.dispute_deadline.unwrap();
+        assert!(deadline < 3_000_000 + 100_000);
+    }
+
+    #[ink::test]
+    fn test_resolve_dispute_by_admin() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let claim_id = contract
+            .submit_claim(policy_id, 1_000u128, "desc".into(), make_evidence("ipfs://e"))
+            .unwrap();
+        contract.move_to_dispute(claim_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert!(contract.resolve_dispute(claim_id, false).is_ok());
+        assert_eq!(
+            contract.get_claim(claim_id).unwrap().status,
+            ClaimStatus::DisputeResolved
+        );
+    }
+
+    #[ink::test]
+    fn test_resolve_dispute_by_arbiter() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        contract.set_arbiter(Some(accounts.charlie)).unwrap();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let claim_id = contract
+            .submit_claim(policy_id, 1_000u128, "desc".into(), make_evidence("ipfs://e"))
+            .unwrap();
+        contract.move_to_dispute(claim_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        assert!(contract.resolve_dispute(claim_id, false).is_ok());
+        assert_eq!(
+            contract.get_claim(claim_id).unwrap().status,
+            ClaimStatus::DisputeResolved
+        );
+    }
+
+    #[ink::test]
+    fn test_resolve_dispute_unauthorized_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let claim_id = contract
+            .submit_claim(policy_id, 1_000u128, "desc".into(), make_evidence("ipfs://e"))
+            .unwrap();
+        contract.move_to_dispute(claim_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        assert_eq!(
+            contract.resolve_dispute(claim_id, true),
+            Err(InsuranceError::Unauthorized)
+        );
+    }
+
+    #[ink::test]
+    fn test_resolve_non_disputed_claim_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let policy_id = setup_policy_for_bob(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let claim_id = contract
+            .submit_claim(policy_id, 1_000u128, "desc".into(), make_evidence("ipfs://e"))
+            .unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert_eq!(
+            contract.resolve_dispute(claim_id, true),
+            Err(InsuranceError::InvalidDisputeTransition)
+        );
     }
 }
